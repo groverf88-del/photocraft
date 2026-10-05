@@ -67,7 +67,7 @@ pub const FX_BUDGET: usize = 1536 << 20;
 /// any size composite on the GPU.
 pub const PAGE: u32 = 2048;
 /// GPU memory resident layer pages may hold before the least recently used are evicted.
-pub const RESIDENT_BUDGET: u64 = 3 << 30;
+pub const RESIDENT_BUDGET: u64 = 4 << 30;
 /// Uploads (bytes) [`Compositor::render`] stages before submitting the work recorded so far, so
 /// a refresh of a huge document never holds all its uploads in staging memory at once.
 const FLUSH_BYTES: u64 = 512 << 20;
@@ -791,12 +791,16 @@ impl Compositor {
         // larger than the budget starts with the pages still resident.
         let page = self.page;
         let mut cells = grid_rects(region, page);
-        if self.frame % 2 == 0 {
+        if self.frame.is_multiple_of(2) {
             cells.reverse();
         }
         stats.cells = cells.len();
-        let mut last_submit = None;
-        let mut work = 0u64;
+        // The previous intermediate submit (waited for before the next is queued; the web has
+        // no blocking wait and relies on the browser's own scheduling).
+        #[cfg(not(target_arch = "wasm32"))]
+        let mut last_submit: Option<wgpu::SubmissionIndex> = None;
+        // Work recorded and bytes evicted since the last submit.
+        let (mut work, mut freed) = (0u64, 0u64);
         for part in cells {
             self.stamp += 1;
             let cell = (part.x0.div_euclid(page as i32), part.y0.div_euclid(page as i32));
@@ -813,24 +817,26 @@ impl Compositor {
             stats.chunks += chunks.len();
             work += part.width() as u64 * part.height() as u64 * plan.passes.len() as u64;
             self.run_cell(device, queue, encoder, doc.id, &plan, &paged, cell, &fr, &chunks, &mut stats, sink);
-            let evicted = self.evict();
+            let (evicted, bytes) = self.evict();
             stats.evicted += evicted;
-            if flush && (self.staged >= FLUSH_BYTES || work >= FLUSH_WORK || evicted > 0) {
+            freed += bytes;
+            if flush && (self.staged >= FLUSH_BYTES || work >= FLUSH_WORK || freed >= FLUSH_BYTES) {
                 // Submit what's recorded, and wait for the previous submit, so at most two
-                // cells' uploads and evicted pages are in flight.
+                // batches of uploads and evicted pages are in flight.
                 let done = std::mem::replace(encoder, device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pc_compose") }));
                 let index = queue.submit([done.finish()]);
                 #[cfg(not(target_arch = "wasm32"))]
-                if let Some(prev) = last_submit.take() {
+                if let Some(prev) = last_submit.replace(index) {
                     let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(prev), timeout: None });
                 }
-                last_submit = Some(index);
+                #[cfg(target_arch = "wasm32")]
+                let _ = index;
                 self.staged = 0;
                 work = 0;
+                freed = 0;
                 stats.flushes += 1;
             }
         }
-        drop(last_submit);
 
         // Evict this document's textures whose layers are gone (hidden layers stay resident so
         // toggling visibility costs no upload).
@@ -838,16 +844,17 @@ impl Compositor {
         let live: std::collections::HashSet<LayerId> = doc.walk().into_iter().map(|(_, _, l)| l.id).collect();
         self.residents.retain(|(id, _, _), r| r.doc != doc.id || r.last_used == frame || live.contains(id));
         self.fx.retain(|(id, _), e| e.doc != doc.id || e.last_used == frame || live.contains(id));
-        stats.evicted += self.evict();
+        stats.evicted += self.evict().0;
         self.temps.retain(|(_, used)| frame.saturating_sub(*used) < 240);
         Ok(stats)
     }
 
     /// Keep resident pages within the resident budget and the effect cache within
     /// [`FX_BUDGET`], least recently used first. Never drops what the current cell uses, nor
-    /// whole-region effect maps drawn this frame. Returns how many textures were dropped.
-    fn evict(&mut self) -> usize {
-        let mut n = 0;
+    /// whole-region effect maps drawn this frame. Returns how many textures were dropped and
+    /// their bytes.
+    fn evict(&mut self) -> (usize, u64) {
+        let (mut n, mut freed) = (0, 0u64);
         let mut total = self.resident_bytes();
         if total > self.resident_budget {
             let mut lru: Vec<(u64, ResKey, u64)> =
@@ -860,6 +867,7 @@ impl Compositor {
                 self.residents.remove(&k);
                 total = total.saturating_sub(bytes);
                 n += 1;
+                freed += bytes;
             }
         }
         let mut total = self.fx_cache_bytes();
@@ -879,10 +887,11 @@ impl Compositor {
                 if let Some(e) = self.fx.remove(&k) {
                     total = total.saturating_sub(e.bytes());
                     n += 1;
+                    freed += e.bytes() as u64;
                 }
             }
         }
-        n
+        (n, freed)
     }
 
     /// Per-frame resources of `plan`: the tile area of each pass's surfaces, its LUT and pattern.

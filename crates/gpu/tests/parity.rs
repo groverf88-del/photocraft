@@ -1262,7 +1262,7 @@ fn pages_are_evicted_under_the_budget() {
         let (out, s) = photocraft_gpu::render_to_vec_stats(&mut g.paged, &g.device, &g.queue, &d, d.bounds()).unwrap();
         let worst = worst_diff(&cpu.px, &out);
         assert!(worst.0 <= TOL, "round {round}: max diff {:.2}/255 at {}", worst.0 * 255.0, worst.1);
-        assert!(s.evicted > 0 && s.flushes > 0, "round {round}: {s:?}");
+        assert!(s.evicted > 0, "round {round}: {s:?}");
         assert!(g.paged.resident_bytes() < all / 4, "{} of {all}", g.paged.resident_bytes());
         // Evicted pages come back with the edits made meanwhile.
         d.layers[2].surface_mut().unwrap().fill_rect(Rect::new(10 + round * 300, 300, 60 + round * 300, 340), &[0.9, 0.9, 0.1, 1.0]);

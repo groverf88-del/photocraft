@@ -46,7 +46,7 @@ fn layer_from(name: &str, r: Rect, f: impl Fn(i32, i32) -> [u8; 4] + Sync) -> La
         let w = band.width() as usize;
         let mut bytes = vec![0u8; w * band.height() as usize * 4];
         bytes.par_chunks_mut(w * 4).enumerate().for_each(|(row, px)| {
-            for (i, p) in px.chunks_exact_mut(4).enumerate() {
+            for (i, p) in px.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 p.copy_from_slice(&f(band.x0 + i as i32, band.y0 + row as i32));
             }
         });
@@ -169,10 +169,11 @@ fn canvas() -> Option<(GpuCanvas, RenderState)> {
 }
 
 /// One canvas refresh (everything, or `damage`), waiting for the GPU. Returns the path taken.
-fn refresh(g: &GpuCanvas, rs: &RenderState, doc: &Document, damage: Option<Rect>) -> (&'static str, Option<String>) {
+fn refresh(g: &GpuCanvas, rs: &RenderState, doc: &Document, damage: Option<Rect>) -> (String, Option<String>) {
     let r = g.refresh(doc.id.0, doc, damage, None);
     let _ = rs.device.poll(eframe::wgpu::PollType::Wait { submission_index: None, timeout: None });
-    (r.kind, r.fallback)
+    let kind = if r.kind.starts_with("gpu") { format!("{}, {} tiles up", r.kind, r.uploads) } else { r.kind.to_string() };
+    (kind, r.fallback)
 }
 
 fn main() {
