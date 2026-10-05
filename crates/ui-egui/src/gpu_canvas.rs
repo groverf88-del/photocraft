@@ -147,6 +147,13 @@ impl GpuCanvas {
         Some((d.format, bytes))
     }
 
+    /// GPU bytes the wgpu compositor holds: resident layer pages and cached effect maps.
+    pub fn compositor_bytes(&self) -> Option<(u64, usize)> {
+        let r = self.rs.renderer.read();
+        let c = r.callback_resources.get::<Resources>()?.compositor.as_ref()?;
+        Some((c.resident_bytes(), c.fx_cache_bytes()))
+    }
+
     /// Set the checkerboard and gamut warning colours.
     pub fn set_style(&self, style: CanvasStyle) {
         let mut r = self.rs.renderer.write();
@@ -174,10 +181,8 @@ impl GpuCanvas {
         }
         match &res.compositor {
             Some(c) => c.supports(doc).is_ok(),
-            None => {
-                let max = self.rs.device.limits().max_texture_dimension_2d;
-                doc.size.width <= max && doc.size.height <= max && photocraft_gpu::plan(doc).is_ok()
-            }
+            // Layers larger than the texture limit are stored in pages, so any size qualifies.
+            None => photocraft_gpu::plan(doc).is_ok(),
         }
     }
 
